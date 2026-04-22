@@ -75,6 +75,7 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
     status = st.empty()
     
     # --- ETL ---
+   # --- ETL ---
     df = pd.read_excel(arquivo, skiprows=1)
     df.dropna(subset=[df.columns[0], df.columns[1]], inplace=True)
     
@@ -89,39 +90,73 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
 
     total = len(df)
     
+    # ⚡ OTIMIZAÇÃO 1: Busca o estado do banco UMA ÚNICA VEZ antes do loop
+    status.text("Verificando imagens existentes no banco...")
+    try:
+        res_banco = supabase.table("produtos").select("id, url_imagem").execute()
+        # Cria um set (busca instantânea na memória RAM) com os IDs que já têm foto
+        produtos_com_foto = {str(p['id']) for p in res_banco.data if p.get('url_imagem')}
+    except Exception as e:
+        st.error(f"Erro ao ler banco: {e}")
+        produtos_com_foto = set()
+
+    status.text(f"Iniciando processamento de {total} itens...")
+    
     for i, row in enumerate(df.iterrows()):
         _, data = row
         id_p, nome_p, cat_p, preco_p = str(data.iloc[0]), str(data.iloc[1]), str(data.iloc[2]), float(data.iloc[3])
         
-        status.text(f"Processando {i+1}/{total}: {nome_p[:30]}...")
-        
-        # Lógica de Imagem (Simplificada para o exemplo)
         img_name = f"{id_p}.jpg"
         url_img = f"{supabase.supabase_url}/storage/v1/object/public/{NOME_BUCKET}/{img_name}"
         
-        # Verifica se já existe (Feedback visual)
-        try:
-            check = supabase.storage.from_(NOME_BUCKET).list(path="", options={"search": img_name})
-            if not any(f['name'] == img_name for f in check):
-                # Raspagem (Omitida aqui por brevidade, use a lógica do seu script anterior)
-                stats["fotos_novas"] += 1
-        except: pass
+        # ⚡ OTIMIZAÇÃO 2: Consulta a memória RAM, não a rede do Supabase
+        imagem_ja_no_bucket = id_p in produtos_com_foto
+
+        if not imagem_ja_no_bucket:
+            pasta_temp = tempfile.mkdtemp()
+            try:
+                crawler = BingImageCrawler(storage={'root_dir': pasta_temp}, log_level=50)
+                crawler.crawl(keyword=nome_p, max_num=1, filters={'type': 'photo'})
+                
+                arquivos_baixados = glob.glob(f"{pasta_temp}/*")
+                if arquivos_baixados:
+                    with open(arquivos_baixados[0], "rb") as f:
+                        supabase.storage.from_(NOME_BUCKET).upload(img_name, f, file_options={"upsert": "true"})
+                    stats["fotos_novas"] += 1
+                else:
+                    url_img = None
+            except Exception:
+                url_img = None
+            finally:
+                import shutil
+                if os.path.exists(pasta_temp):
+                    shutil.rmtree(pasta_temp)
+                time.sleep(1.5) # Atraso obrigatório se raspar, para não ser banido pelo Bing
+        else:
+            # Se já tem imagem, mantém a URL correta sem precisar consultar o bucket
+            url_img = f"{supabase.supabase_url}/storage/v1/object/public/{NOME_BUCKET}/{img_name}"
 
         # Upsert
         try:
-            res = supabase.table("produtos").upsert({
+            supabase.table("produtos").upsert({
                 "id": id_p, "nome": nome_p, "preco": preco_p, "categoria": cat_p, "url_imagem": url_img
             }).execute()
             stats["atualizados"] += 1
         except:
             stats["erros"] += 1
 
-        prog_bar.progress((i + 1) / total)
+        # ⚡ OTIMIZAÇÃO 3: Atualiza a tela (Frontend) APENAS a cada 20 itens ou no último. 
+        # Impede que o WebSocket do Streamlit engasgue e desconecte.
+        if i % 20 == 0 or i == total - 1:
+            status.text(f"Processando {i+1}/{total} | Último: {nome_p[:20]}...")
+            prog_bar.progress((i + 1) / total)
 
     # --- FEEDBACK FINAL (O Dashboard) ---
-    st.success("Sincronização Finalizada!")
+    status.empty() # Limpa o texto de status
+    prog_bar.empty() # Limpa a barra
+    st.success("✅ Sincronização Finalizada!")
     c1, c2, c3 = st.columns(3)
     c1.metric("Produtos Processados", total)
-    c2.metric("Imagens Novas", stats["fotos_novas"])
+    c2.metric("Imagens Novas Baixadas", stats["fotos_novas"])
     c3.metric("Erros de Banco", stats["erros"])
     st.balloons()
