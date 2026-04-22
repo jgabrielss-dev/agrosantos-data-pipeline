@@ -3,9 +3,12 @@ import pandas as pd
 from pathlib import Path
 from supabase import create_client, Client
 from dotenv import load_dotenv
+import time
+import glob
+import shutil
+from icrawler.builtin import BingImageCrawler
 
 # --- CONFIGURAÇÃO DE AMBIENTE ---
-# Carrega as chaves do .env ignorado pelo git
 load_dotenv()
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
@@ -13,98 +16,124 @@ key = os.environ.get("SUPABASE_KEY")
 if not url or not key:
     raise ValueError("Chaves do Supabase não encontradas no .env!")
 
-# Inicializa o cliente do Supabase
 supabase: Client = create_client(url, key)
 
-# --- DEFINIÇÃO DE CAMINHOS ABSOLUTOS SEGUROS ---
-# Caminhos relativos ao local deste script
+# --- CONFIGURAÇÕES E CAMINHOS ---
 BASE_DIR = Path(__file__).resolve().parent
-# Onde está a planilha bruta
-CAMINHO_PLANILHA = BASE_DIR / "planilha.xlsx"
-# Onde estão as imagens locais (baseado na sua estrutura antiga)
-PASTA_IMAGENS_LOCAL = BASE_DIR / "img" 
+CAMINHO_PLANILHA = input("Arraste a planilha ou digite o caminho completo: ").strip()
+
+# Limpeza agressiva para lidar com o drag-and-drop do PowerShell
+CAMINHO_PLANILHA = CAMINHO_PLANILHA.removeprefix("& ").strip() # Remove o operador do Windows
+CAMINHO_PLANILHA = CAMINHO_PLANILHA.strip("'").strip('"')      # Remove as aspas residuais
 
 NOME_BUCKET = "catalog-images"
+
+# --- REGRAS DE NEGÓCIO HARDCODED ---
+IDS_BLOQUEADOS = ['1560', '576', '2435', '749', '942', '2613', '2803', '2899', '2900', '2902', '3005', '3037', '309', '5', '1470', '2733', '958', '588', '6', '702', '2901', '2635', '2709', '2760', '2537', '2542', '2546', '2584', '2497', '1895', '1963', '2202', '2225', '2303', '1916', '1965', '1935', '1951', '1956', '1658', '1771', '1695', '1660', '1451', '1523', '1059', '1294', '1032', '2592', '1958', '1959', '2809', '2812', '2813', '2073', '2419', '2466', '2763', '2769', '2778', '2801', '2496', '2572', '2690', '2147', '2159', '2160', '2151', '2231', '2260', '2278', '1960', '1962', '1966', '1974', '1984', '1985', '1986', '1988', '2021', '2022', '2023', '1731', '2370', '2864', '2079', '2344', '2919', '2428', '2429', '2734', '2264', '2263', '1659', '927', '3292', '1486', '1487', '1485', '2991', '1489', '1488', '1493', '1492', '1798', '1500', '1503', '1501', '1484']
+CATEGORIAS_BLOQUEADAS = ['INSUMO', 'SELARIA']
+TERMOS_BLOQUEADOS = [t for t in ['CINTO', 'INTERRUPT', 'TOMADA', 'PADRON', 'FLAMBADOR', 'CHAMAS', 'VASSOURA', 'FACHOLI', 'PURUCA', 'VASSOURAO', 'INSUMO', 'COLEIRA', 'MULTISHOW', 'GLYPHOTAL', 'ROUNDUP', 'ATRAZINA', 'GLIFOSATO', 'SIMPARIC', 'TECH MASTER', 'CRIADORES', 'CANTONINHO', 'ALCON CLUB', 'DIMY', 'GRANEL', 'SAAD', 'FINOTRATO', 'CHURU', 'cocho', 'COCHO', 'UNICOCHO'] if t]
 
 def executar_etl():
     print("Iniciando Pipeline de Ingestão de Dados (ETL)...")
     
-    if not CAMINHO_PLANILHA.exists():
+    caminho_obj = Path(CAMINHO_PLANILHA)
+    if not caminho_obj.exists():
         print(f"ERRO: Planilha não encontrada em {CAMINHO_PLANILHA}")
         return
 
-    # --- 1. EXTRAÇÃO (Extract) ---
-    print("\n1. Extraindo dados do ERP...")
-    # skiprows=1 assume que o cabeçalho real começa na segunda linha, como no seu código antigo
-    df = pd.read_excel(CAMINHO_PLANILHA, skiprows=1) 
+    # --- 1. EXTRAÇÃO ---
+    print("\n[1/3] Lendo o ERP...")
+    planilha = pd.read_excel(caminho_obj, skiprows=1) 
     
-    # Remove linhas vazias baseadas nas duas primeiras colunas (ID e Nome)
-    df.dropna(subset=[df.columns[0], df.columns[1]], inplace=True)
+    col_id = planilha.columns[0]
+    col_nome = planilha.columns[1]
+    col_cat = planilha.columns[2]
     
-    # --- 2. TRANSFORMAÇÃO (Transform) ---
-    print("2. Tratando e limpando dados...")
-    
-    produtos_processados = []
-    
-    for _, row in df.iterrows():
-        try:
-            # Pega o ID bruto e limpa qualquer vestígio de .0
-            id_bruto = str(row.iloc[0]).replace('.0', '').strip()
-            
-            produto = {
-                "codigo_erp": id_bruto,
-                "nome": str(row.iloc[1]).strip(),
-                "categoria": str(row.iloc[2]).strip(),
-                # Garante que o preço seja um float numérico
-                "preco": float(row.iloc[3]), 
-                "url_imagem": None # Será preenchido no próximo passo
-            }
-            produtos_processados.append(produto)
-        except Exception as e:
-            # Ignora linhas mal formatadas (ex: cabeçalhos repetidos ou rodapé)
-            continue
-            
-    print(f"Total de produtos após limpeza: {len(produtos_processados)}")
+    planilha.dropna(subset=[col_id, col_nome], inplace=True)
 
-    # --- 3. CARGA NO BUCKET & BANCO (Load) ---
-    print("\n3. Iniciando Carga no Storage e Banco de Dados...")
+    # --- 2. TRANSFORMAÇÃO VETORIZADA (Limpeza antes do loop) ---
+    print("[2/3] Filtrando lixo e aplicando regras de negócio...")
     
-    for produto in produtos_processados:
-        codigo = produto["codigo_erp"]
-        nome_arquivo = f"{codigo}.jpg"
-        caminho_foto_local = PASTA_IMAGENS_LOCAL / nome_arquivo
+    # Formata a coluna ID para string pura
+    planilha[col_id] = planilha[col_id].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
+    
+    # Aplica os filtros de bloqueio
+    planilha = planilha[~planilha[col_id].isin(IDS_BLOQUEADOS)]
+    planilha = planilha[~planilha[col_cat].astype(str).str.strip().str.upper().isin(CATEGORIAS_BLOQUEADAS)]
+    
+    padrao_termos = '|'.join(TERMOS_BLOQUEADOS)
+    planilha = planilha[~planilha[col_nome].astype(str).str.upper().str.contains(padrao_termos, na=False, regex=True)]
+
+    print(f"Total de produtos após filtros: {len(planilha)}")
+
+    # --- 3. EXECUÇÃO (Loop, Scraping e Upsert) ---
+    print("\n[3/3] Iniciando sincronização com Supabase (Banco e Bucket)...")
+    
+    for _, row in planilha.iterrows():
+        id_prod = str(row.iloc[0]).replace('.0', '').strip()
+        nome_prod = str(row.iloc[1]).strip()
+        categoria_prod = str(row.iloc[2]).strip()
         
-        # 3.1 Upload da Imagem para o Bucket (Se existir localmente)
-        url_publica = None
-        if caminho_foto_local.exists():
-            print(f"[{codigo}] Fazendo upload da imagem...")
-            try:
-                # Faz o upload (se a imagem já existir no bucket com esse nome, 
-                # a configuração padrão do Supabase falha. O ideal no futuro é verificar antes ou forçar overwrite)
-                with open(caminho_foto_local, "rb") as f:
-                    supabase.storage.from_(NOME_BUCKET).upload(nome_arquivo, f)
-                    
-                # Captura a URL pública
-                url_publica = supabase.storage.from_(NOME_BUCKET).get_public_url(nome_arquivo)
-                
-            except Exception as e:
-                print(f"[{codigo}] Aviso de Storage: {e} (Talvez a imagem já exista no bucket?)")
-                # Se já existir, podemos apenas pegar a URL
-                url_publica = supabase.storage.from_(NOME_BUCKET).get_public_url(nome_arquivo)
-        else:
-             print(f"[{codigo}] AVISO: Imagem {nome_arquivo} não encontrada no disco local.")
-
-        produto["url_imagem"] = url_publica
-
-        # 3.2 Inserção/Atualização (Upsert) na Tabela do Supabase
-        # Exige que 'codigo_erp' seja uma coluna UNIQUE na tabela do banco
         try:
-            print(f"[{codigo}] Sincronizando dados na tabela 'produtos'...")
-            response = supabase.table("produtos").upsert(produto, on_conflict="codigo_erp").execute()
-        except Exception as e:
-             print(f"[{codigo}] ERRO DE BANCO: Falha ao inserir {produto['nome']} - {e}")
+            preco_prod = round(float(row.iloc[3]), 2)
+        except ValueError:
+            print(f"[{id_prod}] Ignorado: Preço inválido.")
+            continue
 
-    print("\nPipeline Finalizado!")
+        url_imagem = f"{url}/storage/v1/object/public/{NOME_BUCKET}/{id_prod}.jpg"
+        nome_arquivo = f"{id_prod}.jpg"
+
+        # TENTA LISTAR O ARQUIVO NO SUPABASE PARA VER SE ELE JÁ EXISTE
+        arquivos_existentes = supabase.storage.from_(NOME_BUCKET).list(path="", options={"search": nome_arquivo})
+        imagem_ja_no_bucket = any(arq['name'] == nome_arquivo for arq in arquivos_existentes)
+
+        if not imagem_ja_no_bucket:
+            print(f"[{id_prod}] Sem foto. Raspando Bing: '{nome_prod}'...")
+            pasta_temp = BASE_DIR / f"temp_{id_prod}"
+            os.makedirs(pasta_temp, exist_ok=True)
+            
+            try:
+                crawler = BingImageCrawler(storage={'root_dir': str(pasta_temp)}, log_level=50)
+                # Filtra para evitar fotos quebradas
+                crawler.crawl(keyword=nome_prod, max_num=1, filters={'type': 'photo'})
+                
+                arquivos_baixados = glob.glob(f"{pasta_temp}/*")
+                if arquivos_baixados:
+                    caminho_imagem_baixada = arquivos_baixados[0]
+                    with open(caminho_imagem_baixada, "rb") as f:
+                        # Upload para o Supabase
+                        supabase.storage.from_(NOME_BUCKET).upload(nome_arquivo, f)
+                    print(f"[{id_prod}] Upload de imagem concluído.")
+                else:
+                    print(f"[{id_prod}] Bing não encontrou imagens. Seguindo sem foto.")
+                    url_imagem = None # Define nulo se não achou, respeitando o contrato Next.js
+            
+            except Exception as e:
+                print(f"[{id_prod}] Falha no scraping/upload: {e}")
+                url_imagem = None
+            
+            finally:
+                if os.path.exists(pasta_temp):
+                    shutil.rmtree(pasta_temp)
+                time.sleep(1) # Delay de respeito à rede
+        else:
+            print(f"[{id_prod}] Imagem já no bucket. Atualizando apenas texto...")
+
+        # UPSERT NO BANCO DE DADOS (Cria ou Atualiza)
+        try:
+            dados_insercao = {
+                "id":        id_prod,
+                "nome":      nome_prod,
+                "preco":     preco_prod,
+                "categoria": categoria_prod,
+                "url_imagem": url_imagem
+            }
+            # O .execute() é inegociável na API Python do Supabase
+            supabase.table("produtos").upsert(dados_insercao).execute()
+        except Exception as e:
+            print(f"[{id_prod}] ERRO DE BANCO DE DADOS: {e}")
+
+    print("\nPipeline Finalizado! O Supabase está sincronizado com o ERP.")
 
 if __name__ == "__main__":
     executar_etl()
