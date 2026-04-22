@@ -34,7 +34,6 @@ def salvar_config(ids, cats, termos):
     }).execute()
     st.toast("Configurações salvas no banco!", icon="💾")
 
-# Carrega os dados iniciais do banco
 config_inicial = carregar_config()
 
 # --- INTERFACE ---
@@ -63,13 +62,11 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
         st.error("Erro: Nenhuma planilha detectada.")
         st.stop()
 
-    # Preparação das listas
     ids_blq = [x.strip() for x in ids_input.split('\n') if x.strip()]
     cats_blq = [x.strip().upper() for x in cats_input.split('\n') if x.strip()]
     termos_blq = [x.strip().upper() for x in termos_input.split('\n') if x.strip()]
 
-    # UI de Feedback Silencioso
-    status_box = st.info("Executando...")
+    status_box = st.info("Executando leitura e sincronização...")
     
     # --- ETL ---
     df = pd.read_excel(arquivo, skiprows=1)
@@ -78,17 +75,21 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
     c_id, c_nome, c_cat, c_preco = df.columns[0], df.columns[1], df.columns[2], df.columns[3]
     df[c_id] = df[c_id].astype(str).str.replace(r'\.0$', '', regex=True).str.strip()
 
-    # Filtros
     df = df[~df[c_id].isin(ids_blq)]
     df = df[~df[c_cat].astype(str).str.strip().str.upper().isin(cats_blq)]
     if termos_blq:
         df = df[~df[c_nome].astype(str).str.upper().str.contains('|'.join(termos_blq), na=False, regex=True)]
 
+    # --- OTIMIZAÇÃO: A VERDADE VEM DO BUCKET ---
     try:
-        res_banco = supabase.table("produtos").select("id, url_imagem").execute()
-        produtos_com_foto = {str(p['id']) for p in res_banco.data if p.get('url_imagem')}
+        # Pede a lista de até 10.000 arquivos do bucket em UMA única chamada de rede
+        res_arquivos = supabase.storage.from_(NOME_BUCKET).list(path="", options={"limit": 10000})
+        # Monta um Set (busca instantânea) com os nomes reais (ex: "102.jpg")
+        arquivos_no_bucket = {f['name'] for f in res_arquivos if f['name'] != '.emptyFolderPlaceholder'}
     except Exception as e:
-        produtos_com_foto = set()
+        status_box.empty()
+        st.error(f"Erro ao ler o Storage: {e}")
+        st.stop()
 
     lote_upsert = [] 
     produtos_baixados_lista = []
@@ -101,7 +102,8 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
         img_name = f"{id_p}.jpg"
         url_img = f"{supabase.supabase_url}/storage/v1/object/public/{NOME_BUCKET}/{img_name}"
         
-        if id_p not in produtos_com_foto:
+        # Agora ele confere diretamente contra a lista de arquivos que existem no bucket
+        if img_name not in arquivos_no_bucket:
             if fotos_raspadas_agora < MAX_SCRAPE_POR_SESSAO:
                 pasta_temp = tempfile.mkdtemp()
                 try:
@@ -125,15 +127,12 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
                     time.sleep(1) 
             else:
                 url_img = None
-        else:
-            url_img = f"{supabase.supabase_url}/storage/v1/object/public/{NOME_BUCKET}/{img_name}"
 
-        # Guarda na memória
         lote_upsert.append({
             "id": id_p, "nome": nome_p, "preco": preco_p, "categoria": cat_p, "url_imagem": url_img
         })
 
-    # --- GRAVAÇÃO ÚNICA (Sem fatiamento) ---
+    # --- GRAVAÇÃO ÚNICA ---
     try:
         supabase.table("produtos").upsert(lote_upsert).execute()
     except Exception as e:
