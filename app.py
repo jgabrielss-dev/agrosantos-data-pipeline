@@ -80,15 +80,27 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
     if termos_blq:
         df = df[~df[c_nome].astype(str).str.upper().str.contains('|'.join(termos_blq), na=False, regex=True)]
 
-    # --- OTIMIZAÇÃO: A VERDADE VEM DO BUCKET ---
+    # --- VARREDURA PAGINADA DO BUCKET (Silenciosa) ---
+    arquivos_no_bucket = set()
+    offset_atual = 0
+    
     try:
-        # Pede a lista de até 10.000 arquivos do bucket em UMA única chamada de rede
-        res_arquivos = supabase.storage.from_(NOME_BUCKET).list(path="", options={"limit": 10000})
-        # Monta um Set (busca instantânea) com os nomes reais (ex: "102.jpg")
-        arquivos_no_bucket = {f['name'] for f in res_arquivos if f['name'] != '.emptyFolderPlaceholder'}
+        while True:
+            blocos = supabase.storage.from_(NOME_BUCKET).list(path="", options={"limit": 1000, "offset": offset_atual})
+            if not blocos:
+                break
+                
+            for f in blocos:
+                nome_arq = f.get('name')
+                if nome_arq and nome_arq != '.emptyFolderPlaceholder':
+                    arquivos_no_bucket.add(nome_arq.lower())
+            
+            if len(blocos) < 1000:
+                break
+            offset_atual += 1000
     except Exception as e:
         status_box.empty()
-        st.error(f"Erro ao ler o Storage: {e}")
+        st.error(f"Erro fatal ao ler o Storage: {e}")
         st.stop()
 
     lote_upsert = [] 
@@ -100,10 +112,10 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
         id_p, nome_p, cat_p, preco_p = str(row_data.iloc[0]), str(row_data.iloc[1]), str(row_data.iloc[2]), float(row_data.iloc[3])
         
         img_name = f"{id_p}.jpg"
+        img_name_lower = img_name.lower()
         url_img = f"{supabase.supabase_url}/storage/v1/object/public/{NOME_BUCKET}/{img_name}"
         
-        # Agora ele confere diretamente contra a lista de arquivos que existem no bucket
-        if img_name not in arquivos_no_bucket:
+        if img_name_lower not in arquivos_no_bucket:
             if fotos_raspadas_agora < MAX_SCRAPE_POR_SESSAO:
                 pasta_temp = tempfile.mkdtemp()
                 try:
@@ -127,6 +139,8 @@ if st.button("🚀 INICIAR PIPELINE", use_container_width=True, type="primary"):
                     time.sleep(1) 
             else:
                 url_img = None
+        else:
+            url_img = f"{supabase.supabase_url}/storage/v1/object/public/{NOME_BUCKET}/{img_name}"
 
         lote_upsert.append({
             "id": id_p, "nome": nome_p, "preco": preco_p, "categoria": cat_p, "url_imagem": url_img
