@@ -9,6 +9,38 @@ from icrawler.builtin import BingImageCrawler
 
 st.set_page_config(page_title="Motor ETL Synthesis", page_icon="⚙️", layout="wide")
 
+# --- BARREIRA DE SEGURANÇA (LOGIN) ---
+if "autenticado" not in st.session_state:
+    st.session_state.autenticado = False
+
+if not st.session_state.autenticado:
+    st.markdown("<br><br>", unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align: center;'>🔒 Acesso Restrito</h1>", unsafe_allow_html=True)
+    st.markdown("<p style='text-align: center; color: gray;'>Insira a senha mestre para acessar o Motor de Sincronização da Agrosantos.</p>", unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        with st.form("login_form"):
+            senha_digitada = st.text_input("Senha", type="password", placeholder="Digite a senha de administrador...")
+            submit_button = st.form_submit_button("Autenticar", use_container_width=True)
+            
+            if submit_button:
+                senha_correta = st.secrets.get("ADMIN_PASSWORD") or os.environ.get("ADMIN_PASSWORD")
+                if not senha_correta:
+                    st.error("ERRO FATAL: Variável 'ADMIN_PASSWORD' não configurada no servidor.")
+                elif senha_digitada == senha_correta:
+                    st.session_state.autenticado = True
+                    st.rerun()
+                else:
+                    st.error("Senha incorreta. Acesso negado.")
+    
+    # st.stop() bloqueia ABSOLUTAMENTE a leitura do resto do código se não estiver logado
+    st.stop() 
+
+# ==========================================
+# SE PASSOU DAQUI, O USUÁRIO ESTÁ AUTENTICADO
+# ==========================================
+
 # --- CONEXÃO ---
 @st.cache_resource
 def get_supabase_client():
@@ -38,6 +70,13 @@ config_inicial = carregar_config()
 
 # --- INTERFACE ---
 st.title("⚙️ Gerenciador de Sincronização")
+
+# Botão de Logout no topo
+col_titulo, col_logout = st.columns([4, 1])
+with col_logout:
+    if st.button("Sair (Logout)", use_container_width=True):
+        st.session_state.autenticado = False
+        st.rerun()
 
 with st.sidebar:
     st.header("💾 Memória do Sistema")
