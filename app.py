@@ -9,6 +9,16 @@ from icrawler.builtin import BingImageCrawler
 
 st.set_page_config(page_title="Motor ETL Synthesis", page_icon="⚙️", layout="wide")
 
+# --- WHITE-LABEL (ESCONDER DEV TOOLS) ---
+esconder_devtools = """
+    <style>
+    #MainMenu {visibility: hidden;}
+    header {visibility: hidden;}
+    footer {visibility: hidden;}
+    </style>
+"""
+st.markdown(esconder_devtools, unsafe_allow_html=True)
+
 # --- BARREIRA DE SEGURANÇA (LOGIN) ---
 if "autenticado" not in st.session_state:
     st.session_state.autenticado = False
